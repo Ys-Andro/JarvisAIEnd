@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <cloud-backup>
+        <!-- Exclude Room SQLite databases from cloud backup -->
+        <exclude domain="database" path="." />
+        <!-- Exclude DataStore preferences from cloud backup -->
+        <exclude domain="file" path="datastore" />
+        <exclude domain="sharedpref" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <!-- Exclude Room SQLite databases from device transfer -->
+        <exclude domain="database" path="." />
+        <!-- Exclude DataStore preferences from device transfer -->
+        <exclude domain="file" path="datastore" />
+        <exclude domain="sharedpref" path="." />
+    </device-transfer>
+</data-extraction-rules>

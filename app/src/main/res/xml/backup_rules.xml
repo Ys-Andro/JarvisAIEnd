@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- Exclude Room SQLite databases from automated backup -->
+    <exclude domain="database" path="." />
+    <!-- Exclude DataStore preferences from automated backup -->
+    <exclude domain="file" path="datastore" />
+    <exclude domain="sharedpref" path="." />
+</full-backup-content>

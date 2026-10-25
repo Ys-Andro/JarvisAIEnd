@@ -1,0 +1,180 @@
+package com.example.jarvisai.data.agent
+
+import android.content.Context
+import com.example.jarvisai.data.action.ActionRegistry
+import com.example.jarvisai.domain.model.Message
+import com.example.jarvisai.domain.repository.IConversationRepository
+import com.example.jarvisai.domain.repository.IDocumentRepository
+import com.example.jarvisai.domain.repository.IInferenceRepository
+import com.example.jarvisai.domain.repository.IMemoryRepository
+import com.example.jarvisai.domain.repository.ISettingsRepository
+import kotlinx.coroutines.flow.first
+import org.json.JSONObject
+
+class AgentOrchestrator(
+    context: Context,
+    conversationRepository: IConversationRepository,
+    memoryRepository: IMemoryRepository,
+    documentRepository: IDocumentRepository,
+    private val inferenceRepository: IInferenceRepository,
+    private val settingsRepository: ISettingsRepository
+) {
+    private val toolRegistry = ToolRegistry(context, memoryRepository, documentRepository)
+    private val verifier = Verifier()
+    private val taskExecutor = TaskExecutor(toolRegistry, verifier)
+    private val contextManager = AgentContextManager(conversationRepository, memoryRepository, documentRepository)
+    private val agentCore = AgentCore(taskExecutor, toolRegistry, inferenceRepository, settingsRepository, contextManager)
+
+    suspend fun executePlan(
+        tasks: List<AgentTask>,
+        goal: String = tasks.firstOrNull()?.toolInput.orEmpty(),
+        conversationId: String? = null,
+        imageBase64: String? = null,
+        imageMimeType: String? = null,
+        onTaskUpdate: (List<AgentTask>) -> Unit
+    ): AgentRunResult {
+        return agentCore.run(
+            initialTasks = tasks,
+            goal = goal,
+            conversationId = conversationId,
+            imageBase64 = imageBase64,
+            imageMimeType = imageMimeType,
+            onTaskUpdate = onTaskUpdate
+        )
+    }
+
+    suspend fun runPlan(
+        tasks: List<AgentTask>,
+        goal: String = tasks.firstOrNull()?.toolInput.orEmpty(),
+        conversationId: String? = null,
+        imageBase64: String? = null,
+        imageMimeType: String? = null,
+        onTaskUpdate: (List<AgentTask>) -> Unit
+    ): String {
+        return when (val result = executePlan(
+            tasks = tasks,
+            goal = goal,
+            conversationId = conversationId,
+            imageBase64 = imageBase64,
+            imageMimeType = imageMimeType,
+            onTaskUpdate = onTaskUpdate
+        )) {
+            is AgentRunResult.Completed -> result.message
+            is AgentRunResult.Failed -> "Plan interrumpido: ${result.message}"
+            is AgentRunResult.WaitingConfirmation -> "Plan pausado: la tarea '${result.task.title}' requiere confirmación del usuario."
+        }
+    }
+
+    suspend fun runGoal(
+        goal: String,
+        conversationId: String? = null,
+        conversationHistory: List<Message> = emptyList(),
+        imageBase64: String? = null,
+        imageMimeType: String? = null,
+        onTaskUpdate: (List<AgentTask>) -> Unit = {}
+    ): String {
+        val initialTasks = createInitialPlan(goal, conversationId, conversationHistory, imageBase64, imageMimeType)
+            ?: return "No pude construir un plan ejecutable para esa solicitud."
+        if (initialTasks.isEmpty()) return "No encontré una acción o herramienta necesaria para completar esa solicitud."
+        return runPlan(
+            tasks = initialTasks,
+            goal = goal,
+            conversationId = conversationId,
+            imageBase64 = imageBase64,
+            imageMimeType = imageMimeType,
+            onTaskUpdate = onTaskUpdate
+        )
+    }
+
+    private suspend fun createInitialPlan(
+        goal: String,
+        conversationId: String?,
+        conversationHistory: List<Message>,
+        imageBase64: String? = null,
+        imageMimeType: String? = null
+    ): List<AgentTask>? {
+        val settings = settingsRepository.getSettings().first()
+        val actionCatalog = ActionRegistry.SUPPORTED_ACTIONS.sorted().joinToString(", ")
+        val context = contextManager.build(goal, conversationId, conversationHistory)
+        val plannerPrompt = """
+            [JARVIS AGENT PLANNER]
+            Convierte el objetivo actual en el menor número posible de pasos ejecutables.
+
+            El usuario puede usar referencias como "el segundo", "eso", "lo mismo",
+            "ahora hazlo", "el anterior" o "esa configuración". Resuelve esas referencias
+            usando el contexto proporcionado antes de crear el plan.
+            Si hay una imagen adjunta, úsala como evidencia visual para comprender el objetivo,
+            identificar elementos, aplicaciones, texto, botones u objetos visibles antes de
+            seleccionar una acción. No inventes información que no sea visible.
+
+            ${context.toPromptBlock()}
+
+            Herramientas disponibles:
+            ${toolRegistry.describeTools()}
+
+            Para ACTION, toolInput debe ser JSON válido con el campo action.
+            Para consultas sobre hora o fecha actual, usa CURRENT_DATETIME y no respondas con conocimiento del modelo.
+            CURRENT_DATETIME consulta directamente el reloj del dispositivo y no requiere parámetros.
+            Acciones Android disponibles: ${actionCatalog}
+            Ejemplo: CURRENT_DATETIME -> obtener la hora y fecha reales del dispositivo.
+            Ejemplos: ACTION -> {"action":"FLASHLIGHT","enable":true}
+            ACTION -> {"action":"VOLUME","level":40}
+            ACTION -> {"action":"SET_TIMER","seconds":300,"message":"Temporizador"}
+            ACTION -> {"action":"OPEN_URL","url":"https://example.com"}
+            ACTION -> {"action":"SAVE_MEMORY","key":"clave","value":"dato","category":"GENERAL"}
+
+            Reglas: devuelve solo JSON; no inventes herramientas; conserva el objetivo actual;
+            NUNCA repitas acciones pasadas de turnos anteriores salvo que el usuario lo pida expresamente en su objetivo actual;
+            si el objetivo actual es una conversación o pregunta informativa sin necesidad de herramientas, devuelve siempre NO_TOOL;
+            usa dependencies cuando corresponda; no repitas una acción ya completada si el
+            usuario pide continuar con otra entidad.
+
+            Si no requiere herramientas: {"decision":"NO_TOOL","tasks":[]}
+            Si requiere herramientas: {"decision":"EXECUTE","tasks":[{"id":"step_1","title":"...","description":"...","toolName":"ACTION","toolInput":"{...}","dependencies":[]}]}
+        """.trimIndent()
+        return try {
+            val response = StringBuilder()
+            inferenceRepository.generateCompletionStream(
+                prompt = plannerPrompt,
+                conversationHistory = context.conversation,
+                settings = settings,
+                imageBase64 = imageBase64,
+                imageMimeType = imageMimeType
+            ).collect { response.append(it) }
+            parseInitialPlan(response.toString())
+        } catch (_: Exception) { null }
+    }
+
+    private fun parseInitialPlan(raw: String): List<AgentTask>? {
+        val normalized = raw.replace("```json", "", ignoreCase = true).replace("```", "").trim()
+        val start = normalized.indexOf('{')
+        val end = normalized.lastIndexOf('}')
+        if (start < 0 || end <= start) return null
+        return try {
+            val root = JSONObject(normalized.substring(start, end + 1))
+            if (!root.optString("decision").equals("EXECUTE", ignoreCase = true)) return emptyList()
+            val array = root.optJSONArray("tasks") ?: return emptyList()
+            val result = mutableListOf<AgentTask>()
+            for (i in 0 until array.length()) {
+                val item = array.optJSONObject(i) ?: continue
+                val title = item.optString("title").trim()
+                val description = item.optString("description").trim()
+                val toolName = item.optString("toolName").trim().uppercase()
+                val toolInput = item.optString("toolInput").trim()
+                val deps = mutableListOf<String>()
+                item.optJSONArray("dependencies")?.let { a -> for (j in 0 until a.length()) deps += a.optString(j).trim() }
+                if (title.isBlank() || toolName.isBlank() || toolInput.isBlank() || !toolRegistry.hasTool(toolName)) continue
+                result += AgentTask(
+                    id = item.optString("id").trim().ifBlank { "step_${i + 1}" },
+                    title = title,
+                    description = description.ifBlank { title },
+                    toolName = toolName,
+                    toolInput = toolInput,
+                    dependencies = deps
+                )
+            }
+            result.take(8).ifEmpty { null }
+        } catch (_: Exception) { null }
+    }
+}
+

@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">JarvisAI</string>
+    <string name="accessibility_service_description">Permite a JarvisAI ayudarte a controlar funciones del teléfono y realizar acciones solicitadas en pantalla.</string>
+</resources>
